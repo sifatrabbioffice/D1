@@ -257,7 +257,7 @@ jobs:
                               }
                           }
                       }
-                      .navigationTitle("\(APP_NAME)")
+                      .navigationTitle(Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "Downloader")
                       .alert("Error", isPresented: $downloader.showError) {
                           Button("OK", role: .cancel) { }
                       } message: {
@@ -656,7 +656,7 @@ jobs:
           }
           EOF
 
-          # Create Info.plist
+          # Create Info.plist with placeholders
           cat > ios/Info.plist <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -664,6 +664,8 @@ jobs:
           <dict>
               <key>CFBundleDevelopmentRegion</key>
               <string>en</string>
+              <key>CFBundleDisplayName</key>
+              <string>__APP_NAME__</string>
               <key>CFBundleExecutable</key>
               <string>$(EXECUTABLE_NAME)</string>
               <key>CFBundleIdentifier</key>
@@ -695,7 +697,7 @@ jobs:
           </plist>
           EOF
 
-          # Create minimal Xcode project (objectVersion 56)
+          # Create minimal Xcode project (objectVersion 56) with placeholders
           cat > ios/CobaltDownloader.xcodeproj/project.pbxproj <<'EOF'
           // !$*UTF8*$!
           {
@@ -973,8 +975,8 @@ jobs:
                               "$(inherited)",
                               "@executable_path/Frameworks",
                           );
-                          PRODUCT_BUNDLE_IDENTIFIER = "$BUNDLE_ID";
-                          PRODUCT_NAME = "$APP_NAME";
+                          PRODUCT_BUNDLE_IDENTIFIER = "__BUNDLE_ID__";
+                          PRODUCT_NAME = "$(TARGET_NAME)";
                           SWIFT_VERSION = 5.0;
                           TARGETED_DEVICE_FAMILY = "1,2";
                       };
@@ -989,8 +991,8 @@ jobs:
                               "$(inherited)",
                               "@executable_path/Frameworks",
                           );
-                          PRODUCT_BUNDLE_IDENTIFIER = "$BUNDLE_ID";
-                          PRODUCT_NAME = "$APP_NAME";
+                          PRODUCT_BUNDLE_IDENTIFIER = "__BUNDLE_ID__";
+                          PRODUCT_NAME = "$(TARGET_NAME)";
                           SWIFT_VERSION = 5.0;
                           TARGETED_DEVICE_FAMILY = "1,2";
                       };
@@ -1022,6 +1024,10 @@ jobs:
               rootObject = 1A00000D0000000000000001 /* Project object */;
           }
           EOF
+
+          # Replace placeholders with actual values
+          sed -i "s/__APP_NAME__/$APP_NAME/g" ios/Info.plist
+          sed -i "s/__BUNDLE_ID__/$BUNDLE_ID/g" ios/CobaltDownloader.xcodeproj/project.pbxproj
 
       # ------------------------------------------------------------
       # 4. BUILD UNSIGNED IPA
