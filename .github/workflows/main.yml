@@ -1,20 +1,153 @@
-name: Build Cobalt Downloader IPA (unsigned)
+name: Build Private API + iOS App
 
 on:
   workflow_dispatch:
+    inputs:
+      api_url:
+        description: 'Your private API base URL (e.g., https://myapi.com)'
+        required: true
+        default: 'http://localhost:8000'
+      app_name:
+        description: 'App display name'
+        required: false
+        default: 'My Downloader'
+      bundle_id:
+        description: 'Bundle identifier'
+        required: false
+        default: 'com.example.mydownloader'
 
 jobs:
   build:
     runs-on: macos-14
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     steps:
-      - name: Create project files
-        run: |
-          mkdir -p project/Sources
-          mkdir -p project/CobaltDownloader.xcodeproj
+      - name: Checkout repository (optional, we create everything from scratch)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          path: repo
+        continue-on-error: true
 
-          cat > project/Sources/CobaltDownloaderApp.swift <<'EOF'
+      # ------------------------------------------------------------
+      # 1. CREATE BACKEND API FILES
+      # ------------------------------------------------------------
+      - name: Create backend API files
+        run: |
+          mkdir -p backend
+          cat > backend/main.py <<'PYEOF'
+          import os
+          import tempfile
+          import uuid
+          from fastapi import FastAPI, HTTPException
+          from fastapi.responses import FileResponse
+          from pydantic import BaseModel
+          import yt_dlp
+          import uvicorn
+
+          app = FastAPI(title="Universal Downloader API")
+
+          class DownloadRequest(BaseModel):
+              url: str
+              mode: str = "auto"  # auto, audio, mute
+
+          @app.post("/api/download")
+          async def download(request: DownloadRequest):
+              video_id = uuid.uuid4().hex[:12]
+              temp_dir = tempfile.mkdtemp()
+              output_template = os.path.join(temp_dir, f"{video_id}.%(ext)s")
+
+              ydl_opts = {
+                  "outtmpl": output_template,
+                  "quiet": True,
+                  "no_warnings": True,
+                  "noplaylist": True,
+                  "retries": 3,
+              }
+
+              if request.mode == "audio":
+                  ydl_opts["format"] = "bestaudio/best"
+                  ydl_opts["postprocessors"] = [{
+                      "key": "FFmpegExtractAudio",
+                      "preferredcodec": "mp3",
+                      "preferredquality": "192",
+                  }]
+              elif request.mode == "mute":
+                  ydl_opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+                  ydl_opts["postprocessors"] = [{
+                      "key": "FFmpegVideoRemuxer",
+                      "preferedformat": "mp4",
+                  }]
+              else:  # auto
+                  ydl_opts["format"] = "best[ext=mp4]/best"
+
+              try:
+                  with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                      info = ydl.extract_info(request.url, download=True)
+                      filename = ydl.prepare_filename(info)
+                      if request.mode == "audio":
+                          filename = os.path.splitext(filename)[0] + ".mp3"
+                      elif request.mode == "mute":
+                          filename = os.path.splitext(filename)[0] + ".mp4"
+                      files = [f for f in os.listdir(temp_dir) if not f.startswith(".")]
+                      if not files:
+                          raise Exception("Download failed")
+                      file_path = os.path.join(temp_dir, files[0])
+                      return FileResponse(
+                          file_path,
+                          filename=os.path.basename(file_path),
+                          media_type="application/octet-stream"
+                      )
+              except Exception as e:
+                  raise HTTPException(status_code=400, detail=str(e))
+
+          if __name__ == "__main__":
+              uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+          PYEOF
+
+          cat > backend/requirements.txt <<'REQEOF'
+          fastapi
+          uvicorn
+          yt-dlp
+          REQEOF
+
+          cat > backend/Dockerfile <<'DOCKEREOF'
+          FROM python:3.11-slim
+          WORKDIR /app
+          COPY requirements.txt .
+          RUN pip install --no-cache-dir -r requirements.txt
+          COPY main.py .
+          CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+          DOCKEREOF
+
+      # ------------------------------------------------------------
+      # 2. (OPTIONAL) BUILD & PUSH DOCKER IMAGE
+      #    Uncomment and set secrets if you want to push to GHCR
+      # ------------------------------------------------------------
+      # - name: Build and push backend Docker image
+      #   uses: docker/build-push-action@v5
+      #   with:
+      #     context: backend
+      #     push: true
+      #     tags: ghcr.io/${{ github.repository }}/downloader-api:latest
+      #   env:
+      #     REGISTRY: ghcr.io
+      #     USERNAME: ${{ github.actor }}
+      #     PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+
+      # ------------------------------------------------------------
+      # 3. CREATE iOS APP FILES
+      # ------------------------------------------------------------
+      - name: Create iOS project files
+        env:
+          API_URL: ${{ github.event.inputs.api_url }}
+          APP_NAME: ${{ github.event.inputs.app_name }}
+          BUNDLE_ID: ${{ github.event.inputs.bundle_id }}
+        run: |
+          mkdir -p ios/Sources
+          mkdir -p ios/CobaltDownloader.xcodeproj
+
+          cat > ios/Sources/CobaltDownloaderApp.swift <<'EOF'
           import SwiftUI
 
           @main
@@ -27,7 +160,7 @@ jobs:
           }
           EOF
 
-          cat > project/Sources/MainTabView.swift <<'EOF'
+          cat > ios/Sources/MainTabView.swift <<'EOF'
           import SwiftUI
 
           struct MainTabView: View {
@@ -46,13 +179,15 @@ jobs:
           }
           EOF
 
-          cat > project/Sources/DownloaderView.swift <<'EOF'
+          cat > ios/Sources/DownloaderView.swift <<'EOF'
           import SwiftUI
 
           struct DownloaderView: View {
               @StateObject private var downloader = DownloadManager()
+              @StateObject private var endpointManager = EndpointManager()
               @State private var urlString = ""
               @State private var downloadMode = "auto"
+              @State private var showEndpointManager = false
 
               var body: some View {
                   NavigationView {
@@ -72,12 +207,32 @@ jobs:
                               .pickerStyle(SegmentedPickerStyle())
                           }
 
+                          Section(header: Text("API Server")) {
+                              Toggle("Auto-try all endpoints", isOn: $endpointManager.autoTryAll)
+                              if !endpointManager.autoTryAll {
+                                  Picker("Endpoint", selection: $endpointManager.selectedEndpointID) {
+                                      ForEach(endpointManager.endpoints) { endpoint in
+                                          Text(endpoint.name).tag(endpoint.id)
+                                      }
+                                  }
+                                  .pickerStyle(MenuPickerStyle())
+                              } else {
+                                  Text("App will try each saved endpoint in order.")
+                                      .font(.footnote)
+                                      .foregroundColor(.secondary)
+                              }
+                              Button("Manage API Endpoints") {
+                                  showEndpointManager = true
+                              }
+                          }
+
                           Section {
                               Button(action: {
                                   Task {
                                       await downloader.download(
                                           urlString: urlString,
-                                          mode: downloadMode
+                                          mode: downloadMode,
+                                          endpoints: endpointManager.getEndpointsToTry()
                                       )
                                   }
                               }) {
@@ -102,18 +257,22 @@ jobs:
                               }
                           }
                       }
-                      .navigationTitle("Cobalt Downloader")
+                      .navigationTitle("\(APP_NAME)")
                       .alert("Error", isPresented: $downloader.showError) {
                           Button("OK", role: .cancel) { }
                       } message: {
                           Text(downloader.errorMessage)
+                      }
+                      .sheet(isPresented: $showEndpointManager) {
+                          EndpointManagerView()
+                              .environmentObject(endpointManager)
                       }
                   }
               }
           }
           EOF
 
-          cat > project/Sources/DownloadsView.swift <<'EOF'
+          cat > ios/Sources/DownloadsView.swift <<'EOF'
           import SwiftUI
 
           struct DownloadsView: View {
@@ -180,15 +339,177 @@ jobs:
           }
           EOF
 
-          cat > project/Sources/DownloadManager.swift <<'EOF'
+          cat > ios/Sources/EndpointManager.swift <<'EOF'
+          import Foundation
+          import SwiftUI
+
+          struct APIEndpoint: Identifiable, Codable, Equatable {
+              var id: UUID = UUID()
+              var name: String
+              var url: String
+          }
+
+          final class EndpointManager: ObservableObject {
+              @Published var endpoints: [APIEndpoint] = [] {
+                  didSet { saveEndpoints() }
+              }
+              @Published var selectedEndpointID: UUID? {
+                  didSet { saveSelected() }
+              }
+              @Published var autoTryAll: Bool = false {
+                  didSet { saveAutoTryAll() }
+              }
+
+              private let endpointsKey = "apiEndpoints"
+              private let selectedKey = "selectedEndpointID"
+              private let autoTryKey = "autoTryAll"
+
+              init() {
+                  load()
+                  if endpoints.isEmpty {
+                      // Default endpoint is the user's private API (baked in)
+                      endpoints = [
+                          APIEndpoint(name: "My Private API", url: "$API_URL")
+                      ]
+                  }
+                  if selectedEndpointID == nil || !endpoints.contains(where: { $0.id == selectedEndpointID }) {
+                      selectedEndpointID = endpoints.first?.id
+                  }
+              }
+
+              func getEndpointsToTry() -> [APIEndpoint] {
+                  if autoTryAll {
+                      return endpoints
+                  } else {
+                      if let selected = endpoints.first(where: { $0.id == selectedEndpointID }) {
+                          return [selected]
+                      }
+                      return []
+                  }
+              }
+
+              func addEndpoint(name: String, url: String) {
+                  let endpoint = APIEndpoint(name: name, url: url)
+                  endpoints.append(endpoint)
+                  if selectedEndpointID == nil {
+                      selectedEndpointID = endpoint.id
+                  }
+              }
+
+              func deleteEndpoint(_ endpoint: APIEndpoint) {
+                  endpoints.removeAll { $0.id == endpoint.id }
+                  if selectedEndpointID == endpoint.id {
+                      selectedEndpointID = endpoints.first?.id
+                  }
+              }
+
+              private func saveEndpoints() {
+                  if let data = try? JSONEncoder().encode(endpoints) {
+                      UserDefaults.standard.set(data, forKey: endpointsKey)
+                  }
+              }
+
+              private func saveSelected() {
+                  if let id = selectedEndpointID {
+                      UserDefaults.standard.set(id.uuidString, forKey: selectedKey)
+                  }
+              }
+
+              private func saveAutoTryAll() {
+                  UserDefaults.standard.set(autoTryAll, forKey: autoTryKey)
+              }
+
+              private func load() {
+                  if let data = UserDefaults.standard.data(forKey: endpointsKey),
+                     let decoded = try? JSONDecoder().decode([APIEndpoint].self, from: data) {
+                      endpoints = decoded
+                  }
+                  if let idString = UserDefaults.standard.string(forKey: selectedKey),
+                     let uuid = UUID(uuidString: idString) {
+                      selectedEndpointID = uuid
+                  }
+                  autoTryAll = UserDefaults.standard.bool(forKey: autoTryKey)
+              }
+          }
+          EOF
+
+          cat > ios/Sources/EndpointManagerView.swift <<'EOF'
+          import SwiftUI
+
+          struct EndpointManagerView: View {
+              @EnvironmentObject var endpointManager: EndpointManager
+              @Environment(\.dismiss) private var dismiss
+              @State private var newName = ""
+              @State private var newURL = ""
+
+              var body: some View {
+                  NavigationView {
+                      List {
+                          Section(header: Text("Saved Endpoints")) {
+                              ForEach(endpointManager.endpoints) { endpoint in
+                                  HStack {
+                                      VStack(alignment: .leading) {
+                                          Text(endpoint.name)
+                                              .font(.headline)
+                                          Text(endpoint.url)
+                                              .font(.caption)
+                                              .foregroundColor(.secondary)
+                                      }
+                                      Spacer()
+                                      if endpoint.id == endpointManager.selectedEndpointID {
+                                          Image(systemName: "checkmark.circle.fill")
+                                              .foregroundColor(.blue)
+                                      }
+                                  }
+                                  .contentShape(Rectangle())
+                                  .onTapGesture {
+                                      endpointManager.selectedEndpointID = endpoint.id
+                                  }
+                                  .swipeActions {
+                                      Button(role: .destructive) {
+                                          endpointManager.deleteEndpoint(endpoint)
+                                      } label: {
+                                          Label("Delete", systemImage: "trash")
+                                      }
+                                  }
+                              }
+                          }
+
+                          Section(header: Text("Add New Endpoint")) {
+                              TextField("Name", text: $newName)
+                              TextField("URL (e.g., https://my-server.com)", text: $newURL)
+                                  .textInputAutocapitalization(.never)
+                                  .disableAutocorrection(true)
+                              Button("Add Endpoint") {
+                                  let name = newName.trimmingCharacters(in: .whitespaces)
+                                  let url = newURL.trimmingCharacters(in: .whitespaces)
+                                  if !name.isEmpty && !url.isEmpty {
+                                      endpointManager.addEndpoint(name: name, url: url)
+                                      newName = ""
+                                      newURL = ""
+                                  }
+                              }
+                              .disabled(newName.isEmpty || newURL.isEmpty)
+                          }
+                      }
+                      .navigationTitle("API Endpoints")
+                      .toolbar {
+                          ToolbarItem(placement: .confirmationAction) {
+                              Button("Done") { dismiss() }
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat > ios/Sources/DownloadManager.swift <<'EOF'
           import Foundation
           import Combine
 
-          struct CobaltResponse: Codable {
-              let status: String?
+          struct DownloadResponse: Codable {
               let url: String?
               let filename: String?
-              let error: String?
           }
 
           @MainActor
@@ -203,15 +524,13 @@ jobs:
               private var downloadTask: URLSessionDownloadTask?
               private var expectedFilename: String = ""
 
-              // Hardcoded fallback endpoints – you can edit this list if you want
-              private let fallbackEndpoints = [
-                  "https://api.cobalt.tools",
-                  "https://co.wuk.sh",
-                  "https://cobalt-api.kwiatekmiki.com",
-                  "https://cobalt-api.vercel.app"
-              ]
+              func download(urlString: String, mode: String, endpoints: [APIEndpoint]) async {
+                  guard !endpoints.isEmpty else {
+                      errorMessage = "No API endpoints configured"
+                      showError = true
+                      return
+                  }
 
-              func download(urlString: String, mode: String) async {
                   isDownloading = true
                   progress = 0
                   downloadedURL = nil
@@ -219,16 +538,16 @@ jobs:
 
                   var lastError = "All endpoints failed"
 
-                  for endpoint in fallbackEndpoints {
+                  for endpoint in endpoints {
                       do {
-                          let mediaURL = try await fetchMediaURL(
+                          let downloadURL = try await fetchDownloadURL(
                               urlString: urlString,
                               mode: mode,
-                              apiBaseURL: endpoint
+                              apiBaseURL: endpoint.url
                           )
-                          // Download the file
+
                           let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
-                          let task = session.downloadTask(with: mediaURL)
+                          let task = session.downloadTask(with: downloadURL)
                           downloadTask = task
                           task.resume()
 
@@ -243,7 +562,7 @@ jobs:
 
                           var filename = expectedFilename
                           if filename.isEmpty {
-                              filename = mediaURL.lastPathComponent
+                              filename = downloadURL.lastPathComponent
                           }
                           let destination = downloadsDir.appendingPathComponent(filename)
                           if fileManager.fileExists(atPath: destination.path) {
@@ -256,7 +575,7 @@ jobs:
                           isDownloading = false
                           return
                       } catch {
-                          lastError = "\(endpoint): \(error.localizedDescription)"
+                          lastError = "\(endpoint.name): \(error.localizedDescription)"
                           progress = 0
                       }
                   }
@@ -266,8 +585,8 @@ jobs:
                   isDownloading = false
               }
 
-              private func fetchMediaURL(urlString: String, mode: String, apiBaseURL: String) async throws -> URL {
-                  guard let url = URL(string: "\(apiBaseURL)/api/json") else {
+              private func fetchDownloadURL(urlString: String, mode: String, apiBaseURL: String) async throws -> URL {
+                  guard let url = URL(string: "\(apiBaseURL)/api/download") else {
                       throw NSError(domain: "Invalid API URL", code: 0)
                   }
 
@@ -278,7 +597,7 @@ jobs:
 
                   let body: [String: String] = [
                       "url": urlString,
-                      "downloadMode": mode
+                      "mode": mode
                   ]
                   request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
@@ -287,19 +606,14 @@ jobs:
                         (200...299).contains(httpResponse.statusCode) else {
                       throw NSError(domain: "API error: \(response)", code: 1)
                   }
-                  let decoded = try JSONDecoder().decode(CobaltResponse.self, from: data)
-                  if decoded.status == "error" || decoded.status == "failed" {
-                      throw NSError(domain: decoded.error ?? "Unknown API error", code: 2)
-                  }
-                  guard let mediaURLString = decoded.url,
-                        let mediaURL = URL(string: mediaURLString) else {
-                      throw NSError(domain: "No media URL returned", code: 3)
+                  let decoded = try JSONDecoder().decode(DownloadResponse.self, from: data)
+                  guard let downloadURLString = decoded.url,
+                        let downloadURL = URL(string: downloadURLString) else {
+                      throw NSError(domain: "No download URL returned", code: 3)
                   }
                   expectedFilename = decoded.filename ?? ""
-                  return mediaURL
+                  return downloadURL
               }
-
-              // MARK: - URLSessionDownloadDelegate
 
               nonisolated func urlSession(
                   _ session: URLSession,
@@ -343,7 +657,7 @@ jobs:
           EOF
 
           # Create Info.plist
-          cat > project/Info.plist <<'EOF'
+          cat > ios/Info.plist <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -382,7 +696,7 @@ jobs:
           EOF
 
           # Create minimal Xcode project (objectVersion 56)
-          cat > project/CobaltDownloader.xcodeproj/project.pbxproj <<'EOF'
+          cat > ios/CobaltDownloader.xcodeproj/project.pbxproj <<'EOF'
           // !$*UTF8*$!
           {
               archiveVersion = 1;
@@ -396,7 +710,9 @@ jobs:
                   1A0000010000000000000002 /* MainTabView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000020000000000000002 /* MainTabView.swift */; };
                   1A0000010000000000000003 /* DownloaderView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000020000000000000003 /* DownloaderView.swift */; };
                   1A0000010000000000000004 /* DownloadsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000020000000000000004 /* DownloadsView.swift */; };
-                  1A0000010000000000000005 /* DownloadManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000020000000000000005 /* DownloadManager.swift */; };
+                  1A0000010000000000000005 /* EndpointManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000020000000000000005 /* EndpointManager.swift */; };
+                  1A0000010000000000000006 /* EndpointManagerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000020000000000000006 /* EndpointManagerView.swift */; };
+                  1A0000010000000000000007 /* DownloadManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000020000000000000007 /* DownloadManager.swift */; };
           /* End PBXBuildFile section */
 
           /* Begin PBXFileReference section */
@@ -404,7 +720,9 @@ jobs:
                   1A0000020000000000000002 /* MainTabView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainTabView.swift; sourceTree = "<group>"; };
                   1A0000020000000000000003 /* DownloaderView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloaderView.swift; sourceTree = "<group>"; };
                   1A0000020000000000000004 /* DownloadsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadsView.swift; sourceTree = "<group>"; };
-                  1A0000020000000000000005 /* DownloadManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadManager.swift; sourceTree = "<group>"; };
+                  1A0000020000000000000005 /* EndpointManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EndpointManager.swift; sourceTree = "<group>"; };
+                  1A0000020000000000000006 /* EndpointManagerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EndpointManagerView.swift; sourceTree = "<group>"; };
+                  1A0000020000000000000007 /* DownloadManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadManager.swift; sourceTree = "<group>"; };
                   1A0000030000000000000001 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
                   1A0000040000000000000001 /* CobaltDownloader.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CobaltDownloader.app; sourceTree = BUILT_PRODUCTS_DIR; };
           /* End PBXFileReference section */
@@ -436,7 +754,9 @@ jobs:
                           1A0000020000000000000002 /* MainTabView.swift */,
                           1A0000020000000000000003 /* DownloaderView.swift */,
                           1A0000020000000000000004 /* DownloadsView.swift */,
-                          1A0000020000000000000005 /* DownloadManager.swift */,
+                          1A0000020000000000000005 /* EndpointManager.swift */,
+                          1A0000020000000000000006 /* EndpointManagerView.swift */,
+                          1A0000020000000000000007 /* DownloadManager.swift */,
                       );
                       path = Sources;
                       sourceTree = "<group>";
@@ -521,7 +841,9 @@ jobs:
                           1A0000010000000000000002 /* MainTabView.swift in Sources */,
                           1A0000010000000000000003 /* DownloaderView.swift in Sources */,
                           1A0000010000000000000004 /* DownloadsView.swift in Sources */,
-                          1A0000010000000000000005 /* DownloadManager.swift in Sources */,
+                          1A0000010000000000000005 /* EndpointManager.swift in Sources */,
+                          1A0000010000000000000006 /* EndpointManagerView.swift in Sources */,
+                          1A0000010000000000000007 /* DownloadManager.swift in Sources */,
                       );
                       runOnlyForDeploymentPostprocessing = 0;
                   };
@@ -651,8 +973,8 @@ jobs:
                               "$(inherited)",
                               "@executable_path/Frameworks",
                           );
-                          PRODUCT_BUNDLE_IDENTIFIER = com.example.cobaltdownloader;
-                          PRODUCT_NAME = "$(TARGET_NAME)";
+                          PRODUCT_BUNDLE_IDENTIFIER = "$BUNDLE_ID";
+                          PRODUCT_NAME = "$APP_NAME";
                           SWIFT_VERSION = 5.0;
                           TARGETED_DEVICE_FAMILY = "1,2";
                       };
@@ -667,8 +989,8 @@ jobs:
                               "$(inherited)",
                               "@executable_path/Frameworks",
                           );
-                          PRODUCT_BUNDLE_IDENTIFIER = com.example.cobaltdownloader;
-                          PRODUCT_NAME = "$(TARGET_NAME)";
+                          PRODUCT_BUNDLE_IDENTIFIER = "$BUNDLE_ID";
+                          PRODUCT_NAME = "$APP_NAME";
                           SWIFT_VERSION = 5.0;
                           TARGETED_DEVICE_FAMILY = "1,2";
                       };
@@ -701,8 +1023,11 @@ jobs:
           }
           EOF
 
+      # ------------------------------------------------------------
+      # 4. BUILD UNSIGNED IPA
+      # ------------------------------------------------------------
       - name: Build unsigned IPA
-        working-directory: project
+        working-directory: ios
         run: |
           xcodebuild \
             -project CobaltDownloader.xcodeproj \
@@ -720,10 +1045,10 @@ jobs:
 
           mkdir -p Payload
           cp -R "$APP_PATH" Payload/
-          zip -qr CobaltDownloader-unsigned.ipa Payload
+          zip -qr "$APP_NAME-unsigned.ipa" Payload
 
       - name: Upload unsigned IPA
         uses: actions/upload-artifact@v4
         with:
-          name: CobaltDownloader-unsigned-ipa
-          path: project/CobaltDownloader-unsigned.ipa
+          name: ${{ github.event.inputs.app_name }}-unsigned-ipa
+          path: ios/${{ github.event.inputs.app_name }}-unsigned.ipa
