@@ -1034,6 +1034,8 @@ jobs:
       # 4. BUILD UNSIGNED IPA
       # ------------------------------------------------------------
       - name: Build unsigned IPA
+        env:
+          APP_NAME: ${{ github.event.inputs.app_name }}
         working-directory: ios
         run: |
           xcodebuild \
