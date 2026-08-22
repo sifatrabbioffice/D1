@@ -75,12 +75,19 @@ jobs:
                           }
 
                           Section(header: Text("API Server")) {
-                              Picker("Endpoint", selection: $endpointManager.selectedEndpointID) {
-                                  ForEach(endpointManager.endpoints) { endpoint in
-                                      Text(endpoint.name).tag(endpoint.id)
+                              Toggle("Auto-try all endpoints", isOn: $endpointManager.autoTryAll)
+                              if !endpointManager.autoTryAll {
+                                  Picker("Endpoint", selection: $endpointManager.selectedEndpointID) {
+                                      ForEach(endpointManager.endpoints) { endpoint in
+                                          Text(endpoint.name).tag(endpoint.id)
+                                      }
                                   }
+                                  .pickerStyle(MenuPickerStyle())
+                              } else {
+                                  Text("App will try each saved endpoint in order.")
+                                      .font(.footnote)
+                                      .foregroundColor(.secondary)
                               }
-                              .pickerStyle(MenuPickerStyle())
                               Button("Manage API Endpoints") {
                                   showEndpointManager = true
                               }
@@ -88,13 +95,11 @@ jobs:
 
                           Section {
                               Button(action: {
-                                  let selected = endpointManager.endpoints.first { $0.id == endpointManager.selectedEndpointID }
-                                  guard let baseURL = selected?.url else { return }
                                   Task {
                                       await downloader.download(
                                           urlString: urlString,
                                           mode: downloadMode,
-                                          apiBaseURL: baseURL
+                                          endpoints: endpointManager.getEndpointsToTry()
                                       )
                                   }
                               }) {
@@ -139,7 +144,6 @@ jobs:
 
           struct DownloadsView: View {
               @State private var files: [URL] = []
-              @State private var refreshID = UUID()
               private let downloadsDir: URL = {
                   let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
                   return docs.appendingPathComponent("Downloads", isDirectory: true)
@@ -177,7 +181,6 @@ jobs:
                           }
                       }
                       .navigationTitle("Downloads")
-                      .id(refreshID)
                       .onAppear(perform: loadFiles)
                   }
               }
@@ -190,7 +193,6 @@ jobs:
                   } catch {
                       files = []
                   }
-                  refreshID = UUID()
               }
           }
 
@@ -216,24 +218,43 @@ jobs:
 
           final class EndpointManager: ObservableObject {
               @Published var endpoints: [APIEndpoint] = [] {
-                  didSet { save() }
+                  didSet { saveEndpoints() }
               }
               @Published var selectedEndpointID: UUID? {
                   didSet { saveSelected() }
               }
+              @Published var autoTryAll: Bool = false {
+                  didSet { saveAutoTryAll() }
+              }
 
               private let endpointsKey = "apiEndpoints"
               private let selectedKey = "selectedEndpointID"
+              private let autoTryKey = "autoTryAll"
 
               init() {
                   load()
                   if endpoints.isEmpty {
+                      // Built-in defaults – you can add more
                       endpoints = [
-                          APIEndpoint(name: "Cobalt Public", url: "https://api.cobalt.tools")
+                          APIEndpoint(name: "Cobalt Official", url: "https://api.cobalt.tools"),
+                          APIEndpoint(name: "Cobalt Public 2", url: "https://co.wuk.sh"),
+                          APIEndpoint(name: "Cobalt Public 3", url: "https://cobalt-api.kwiatekmiki.com"),
+                          APIEndpoint(name: "Cobalt Public 4", url: "https://cobalt-api.vercel.app")
                       ]
                   }
                   if selectedEndpointID == nil || !endpoints.contains(where: { $0.id == selectedEndpointID }) {
                       selectedEndpointID = endpoints.first?.id
+                  }
+              }
+
+              func getEndpointsToTry() -> [APIEndpoint] {
+                  if autoTryAll {
+                      return endpoints
+                  } else {
+                      if let selected = endpoints.first(where: { $0.id == selectedEndpointID }) {
+                          return [selected]
+                      }
+                      return []
                   }
               }
 
@@ -252,7 +273,7 @@ jobs:
                   }
               }
 
-              private func save() {
+              private func saveEndpoints() {
                   if let data = try? JSONEncoder().encode(endpoints) {
                       UserDefaults.standard.set(data, forKey: endpointsKey)
                   }
@@ -264,6 +285,10 @@ jobs:
                   }
               }
 
+              private func saveAutoTryAll() {
+                  UserDefaults.standard.set(autoTryAll, forKey: autoTryKey)
+              }
+
               private func load() {
                   if let data = UserDefaults.standard.data(forKey: endpointsKey),
                      let decoded = try? JSONDecoder().decode([APIEndpoint].self, from: data) {
@@ -273,6 +298,7 @@ jobs:
                      let uuid = UUID(uuidString: idString) {
                       selectedEndpointID = uuid
                   }
+                  autoTryAll = UserDefaults.standard.bool(forKey: autoTryKey)
               }
           }
           EOF
@@ -370,8 +396,10 @@ jobs:
               private var downloadTask: URLSessionDownloadTask?
               private var expectedFilename: String = ""
 
-              func download(urlString: String, mode: String, apiBaseURL: String) async {
-                  guard let mediaURL = await fetchMediaURL(urlString: urlString, mode: mode, apiBaseURL: apiBaseURL) else {
+              func download(urlString: String, mode: String, endpoints: [APIEndpoint]) async {
+                  guard !endpoints.isEmpty else {
+                      errorMessage = "No API endpoints configured"
+                      showError = true
                       return
                   }
 
@@ -380,48 +408,58 @@ jobs:
                   downloadedURL = nil
                   errorMessage = ""
 
-                  let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
-                  let task = session.downloadTask(with: mediaURL)
-                  downloadTask = task
-                  task.resume()
+                  var lastError = "All endpoints failed"
 
-                  do {
-                      let tempURL = try await withCheckedThrowingContinuation { continuation in
-                          downloadContinuation = continuation
+                  for endpoint in endpoints {
+                      do {
+                          let mediaURL = try await fetchMediaURL(
+                              urlString: urlString,
+                              mode: mode,
+                              apiBaseURL: endpoint.url
+                          )
+                          // Download the file
+                          let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+                          let task = session.downloadTask(with: mediaURL)
+                          downloadTask = task
+                          task.resume()
+
+                          let tempURL = try await withCheckedThrowingContinuation { continuation in
+                              downloadContinuation = continuation
+                          }
+
+                          let fileManager = FileManager.default
+                          let documents = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                          let downloadsDir = documents.appendingPathComponent("Downloads", isDirectory: true)
+                          try fileManager.createDirectory(at: downloadsDir, withIntermediateDirectories: true)
+
+                          var filename = expectedFilename
+                          if filename.isEmpty {
+                              filename = mediaURL.lastPathComponent
+                          }
+                          let destination = downloadsDir.appendingPathComponent(filename)
+                          if fileManager.fileExists(atPath: destination.path) {
+                              try fileManager.removeItem(at: destination)
+                          }
+                          try fileManager.moveItem(at: tempURL, to: destination)
+
+                          downloadedURL = destination
+                          progress = 1.0
+                          isDownloading = false
+                          return
+                      } catch {
+                          lastError = "\(endpoint.name): \(error.localizedDescription)"
+                          progress = 0
                       }
-
-                      let fileManager = FileManager.default
-                      let documents = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
-                      let downloadsDir = documents.appendingPathComponent("Downloads", isDirectory: true)
-                      try fileManager.createDirectory(at: downloadsDir, withIntermediateDirectories: true)
-
-                      var filename = expectedFilename
-                      if filename.isEmpty {
-                          filename = mediaURL.lastPathComponent
-                      }
-                      let destination = downloadsDir.appendingPathComponent(filename)
-                      if fileManager.fileExists(atPath: destination.path) {
-                          try fileManager.removeItem(at: destination)
-                      }
-                      try fileManager.moveItem(at: tempURL, to: destination)
-
-                      downloadedURL = destination
-                      progress = 1.0
-                  } catch {
-                      errorMessage = "Download failed: \(error.localizedDescription)"
-                      showError = true
                   }
 
+                  errorMessage = lastError
+                  showError = true
                   isDownloading = false
-                  downloadContinuation = nil
-                  downloadTask = nil
               }
 
-              private func fetchMediaURL(urlString: String, mode: String, apiBaseURL: String) async -> URL? {
+              private func fetchMediaURL(urlString: String, mode: String, apiBaseURL: String) async throws -> URL {
                   guard let url = URL(string: "\(apiBaseURL)/api/json") else {
-                      errorMessage = "Invalid API URL"
-                      showError = true
-                      return nil
+                      throw NSError(domain: "Invalid API URL", code: 0)
                   }
 
                   var request = URLRequest(url: url)
@@ -433,35 +471,23 @@ jobs:
                       "url": urlString,
                       "downloadMode": mode
                   ]
-                  request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+                  request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-                  do {
-                      let (data, response) = try await URLSession.shared.data(for: request)
-                      guard let httpResponse = response as? HTTPURLResponse,
-                            (200...299).contains(httpResponse.statusCode) else {
-                          errorMessage = "API error: \(response)"
-                          showError = true
-                          return nil
-                      }
-                      let decoded = try JSONDecoder().decode(CobaltResponse.self, from: data)
-                      if decoded.status == "error" || decoded.status == "failed" {
-                          errorMessage = decoded.error ?? "Unknown API error"
-                          showError = true
-                          return nil
-                      }
-                      guard let mediaURLString = decoded.url,
-                            let mediaURL = URL(string: mediaURLString) else {
-                          errorMessage = "No media URL returned"
-                          showError = true
-                          return nil
-                      }
-                      expectedFilename = decoded.filename ?? ""
-                      return mediaURL
-                  } catch {
-                      errorMessage = "API request failed: \(error.localizedDescription)"
-                      showError = true
-                      return nil
+                  let (data, response) = try await URLSession.shared.data(for: request)
+                  guard let httpResponse = response as? HTTPURLResponse,
+                        (200...299).contains(httpResponse.statusCode) else {
+                      throw NSError(domain: "API error: \(response)", code: 1)
                   }
+                  let decoded = try JSONDecoder().decode(CobaltResponse.self, from: data)
+                  if decoded.status == "error" || decoded.status == "failed" {
+                      throw NSError(domain: decoded.error ?? "Unknown API error", code: 2)
+                  }
+                  guard let mediaURLString = decoded.url,
+                        let mediaURL = URL(string: mediaURLString) else {
+                      throw NSError(domain: "No media URL returned", code: 3)
+                  }
+                  expectedFilename = decoded.filename ?? ""
+                  return mediaURL
               }
 
               // MARK: - URLSessionDownloadDelegate
