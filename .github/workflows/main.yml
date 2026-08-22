@@ -1,0 +1,104 @@
+name: Build unsigned Cobalt IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      cobalt_url:
+        description: 'Cobalt web app URL (https://...)'
+        required: true
+        default: 'https://cobalt.tools'
+      app_name:
+        description: 'App display name'
+        required: false
+        default: 'Cobalt'
+      bundle_id:
+        description: 'Bundle identifier'
+        required: false
+        default: 'com.example.cobalt'
+
+jobs:
+  build-unsigned-ipa:
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout cobalt repository
+        uses: actions/checkout@v4
+        with:
+          repository: imputnet/cobalt
+          path: cobalt
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Create Capacitor wrapper
+        working-directory: ${{ github.workspace }}/cobalt
+        run: |
+          mkdir -p wrapper
+          cd wrapper
+          npm init -y
+          npm install --no-audit --no-fund @capacitor/core @capacitor/cli @capacitor/ios
+
+          cat > capacitor.config.json <<EOF
+          {
+            "appId": "${{ github.event.inputs.bundle_id }}",
+            "appName": "${{ github.event.inputs.app_name }}",
+            "webDir": "www",
+            "server": {
+              "allowNavigation": ["*"]
+            }
+          }
+          EOF
+
+          mkdir -p www
+          cat > www/index.html <<EOF
+          <!DOCTYPE html>
+          <html>
+            <head>
+              <meta charset="utf-8">
+              <title>${{ github.event.inputs.app_name }}</title>
+              <meta http-equiv="refresh" content="0; url=${{ github.event.inputs.cobalt_url }}">
+            </head>
+            <body>
+              <script>
+                window.location.replace('${{ github.event.inputs.cobalt_url }}');
+              </script>
+            </body>
+          </html>
+          EOF
+
+      - name: Add iOS platform
+        working-directory: ${{ github.workspace }}/cobalt/wrapper
+        run: |
+          npx cap add ios
+          npx cap sync ios
+
+      - name: Build unsigned IPA
+        working-directory: ${{ github.workspace }}/cobalt/wrapper/ios/App
+        run: |
+          xcodebuild \
+            -workspace App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            IPHONEOS_DEPLOYMENT_TARGET=13.0
+
+          APP_PATH=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          echo "App bundle: $APP_PATH"
+
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qr "${{ github.event.inputs.app_name }}-unsigned.ipa" Payload
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.app_name }}-unsigned-ipa
+          path: ${{ github.workspace }}/cobalt/wrapper/ios/App/${{ github.event.inputs.app_name }}-unsigned.ipa
