@@ -93,6 +93,7 @@ jobs:
                       if not files:
                           raise Exception("Download failed")
                       file_path = os.path.join(temp_dir, files[0])
+                      # Return the file directly; filename is set from the file path
                       return FileResponse(
                           file_path,
                           filename=os.path.basename(file_path),
@@ -503,26 +504,23 @@ jobs:
           }
           EOF
 
+          # UPDATED DownloadManager.swift – now handles direct binary response
           cat > ios/Sources/DownloadManager.swift <<'EOF'
           import Foundation
           import Combine
 
-          struct DownloadResponse: Codable {
-              let url: String?
-              let filename: String?
-          }
-
           @MainActor
-          final class DownloadManager: NSObject, ObservableObject, URLSessionDownloadDelegate {
+          final class DownloadManager: NSObject, ObservableObject, URLSessionDataDelegate {
               @Published var progress: Double = 0
               @Published var isDownloading = false
               @Published var downloadedURL: URL?
               @Published var showError = false
               @Published var errorMessage = ""
 
-              private var downloadContinuation: CheckedContinuation<URL, Error>?
-              private var downloadTask: URLSessionDownloadTask?
-              private var expectedFilename: String = ""
+              private var downloadTask: URLSessionDataTask?
+              private var receivedData = Data()
+              private var expectedContentLength: Int64 = 0
+              private var continuation: CheckedContinuation<Data, Error>?
 
               func download(urlString: String, mode: String, endpoints: [APIEndpoint]) async {
                   guard !endpoints.isEmpty else {
@@ -540,38 +538,9 @@ jobs:
 
                   for endpoint in endpoints {
                       do {
-                          let downloadURL = try await fetchDownloadURL(
-                              urlString: urlString,
-                              mode: mode,
-                              apiBaseURL: endpoint.url
-                          )
-
-                          let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
-                          let task = session.downloadTask(with: downloadURL)
-                          downloadTask = task
-                          task.resume()
-
-                          let tempURL = try await withCheckedThrowingContinuation { continuation in
-                              downloadContinuation = continuation
-                          }
-
-                          let fileManager = FileManager.default
-                          let documents = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
-                          let downloadsDir = documents.appendingPathComponent("Downloads", isDirectory: true)
-                          try fileManager.createDirectory(at: downloadsDir, withIntermediateDirectories: true)
-
-                          var filename = expectedFilename
-                          if filename.isEmpty {
-                              filename = downloadURL.lastPathComponent
-                          }
-                          let destination = downloadsDir.appendingPathComponent(filename)
-                          if fileManager.fileExists(atPath: destination.path) {
-                              try fileManager.removeItem(at: destination)
-                          }
-                          try fileManager.moveItem(at: tempURL, to: destination)
-
-                          downloadedURL = destination
-                          progress = 1.0
+                          let data = try await downloadData(from: endpoint.url, urlString: urlString, mode: mode)
+                          try await saveData(data)
+                          // Success
                           isDownloading = false
                           return
                       } catch {
@@ -585,7 +554,7 @@ jobs:
                   isDownloading = false
               }
 
-              private func fetchDownloadURL(urlString: String, mode: String, apiBaseURL: String) async throws -> URL {
+              private func downloadData(from apiBaseURL: String, urlString: String, mode: String) async throws -> Data {
                   guard let url = URL(string: "\(apiBaseURL)/api/download") else {
                       throw NSError(domain: "Invalid API URL", code: 0)
                   }
@@ -601,43 +570,68 @@ jobs:
                   ]
                   request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-                  let (data, response) = try await URLSession.shared.data(for: request)
-                  guard let httpResponse = response as? HTTPURLResponse,
-                        (200...299).contains(httpResponse.statusCode) else {
-                      throw NSError(domain: "API error: \(response)", code: 1)
+                  let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+                  downloadTask = session.dataTask(with: request)
+                  downloadTask?.resume()
+
+                  return try await withCheckedThrowingContinuation { cont in
+                      continuation = cont
                   }
-                  let decoded = try JSONDecoder().decode(DownloadResponse.self, from: data)
-                  guard let downloadURLString = decoded.url,
-                        let downloadURL = URL(string: downloadURLString) else {
-                      throw NSError(domain: "No download URL returned", code: 3)
+              }
+
+              private func saveData(_ data: Data) async throws {
+                  let fileManager = FileManager.default
+                  let documents = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                  let downloadsDir = documents.appendingPathComponent("Downloads", isDirectory: true)
+                  try fileManager.createDirectory(at: downloadsDir, withIntermediateDirectories: true)
+
+                  let filename = "download_\(Int(Date().timeIntervalSince1970)).mp4" // default, will try to get from Content-Disposition
+                  // Try to get filename from Content-Disposition if available
+                  if let response = downloadTask?.response as? HTTPURLResponse,
+                     let disposition = response.allHeaderFields["Content-Disposition"] as? String,
+                     let filenameRange = disposition.range(of: "filename=") {
+                      let start = disposition.index(filenameRange.upperBound, offsetBy: 0)
+                      if let end = disposition.range(of: ";", range: start..<disposition.endIndex)?.lowerBound {
+                          let extracted = disposition[start..<end].replacingOccurrences(of: "\"", with: "")
+                          if !extracted.isEmpty {
+                              let destination = downloadsDir.appendingPathComponent(extracted)
+                              try data.write(to: destination)
+                              downloadedURL = destination
+                              progress = 1.0
+                              return
+                          }
+                      }
                   }
-                  expectedFilename = decoded.filename ?? ""
-                  return downloadURL
+
+                  // Fallback filename
+                  let destination = downloadsDir.appendingPathComponent(filename)
+                  try data.write(to: destination)
+                  downloadedURL = destination
+                  progress = 1.0
+              }
+
+              // MARK: - URLSessionDataDelegate
+
+              nonisolated func urlSession(
+                  _ session: URLSession,
+                  dataTask: URLSessionDataTask,
+                  didReceive response: URLResponse,
+                  completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+              ) {
+                  expectedContentLength = response.expectedContentLength
+                  completionHandler(.allow)
               }
 
               nonisolated func urlSession(
                   _ session: URLSession,
-                  downloadTask: URLSessionDownloadTask,
-                  didWriteData bytesWritten: Int64,
-                  totalBytesWritten: Int64,
-                  totalBytesExpectedToWrite: Int64
-              ) {
-                  let progress = totalBytesExpectedToWrite > 0
-                      ? Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)
-                      : 0
-                  Task { @MainActor in
-                      self.progress = progress
-                  }
-              }
-
-              nonisolated func urlSession(
-                  _ session: URLSession,
-                  downloadTask: URLSessionDownloadTask,
-                  didFinishDownloadingTo location: URL
+                  dataTask: URLSessionDataTask,
+                  didReceive data: Data
               ) {
                   Task { @MainActor in
-                      self.downloadContinuation?.resume(returning: location)
-                      self.downloadContinuation = nil
+                      self.receivedData.append(data)
+                      if self.expectedContentLength > 0 {
+                          self.progress = Double(self.receivedData.count) / Double(self.expectedContentLength)
+                      }
                   }
               }
 
@@ -646,11 +640,15 @@ jobs:
                   task: URLSessionTask,
                   didCompleteWithError error: Error?
               ) {
-                  if let error = error {
-                      Task { @MainActor in
-                          self.downloadContinuation?.resume(throwing: error)
-                          self.downloadContinuation = nil
+                  Task { @MainActor in
+                      if let error = error {
+                          self.continuation?.resume(throwing: error)
+                      } else {
+                          self.continuation?.resume(returning: self.receivedData)
                       }
+                      self.continuation = nil
+                      self.receivedData = Data()
+                      self.expectedContentLength = 0
                   }
               }
           }
