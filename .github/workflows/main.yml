@@ -51,10 +51,8 @@ jobs:
 
           struct DownloaderView: View {
               @StateObject private var downloader = DownloadManager()
-              @StateObject private var endpointManager = EndpointManager()
               @State private var urlString = ""
               @State private var downloadMode = "auto"
-              @State private var showEndpointManager = false
 
               var body: some View {
                   NavigationView {
@@ -74,32 +72,12 @@ jobs:
                               .pickerStyle(SegmentedPickerStyle())
                           }
 
-                          Section(header: Text("API Server")) {
-                              Toggle("Auto-try all endpoints", isOn: $endpointManager.autoTryAll)
-                              if !endpointManager.autoTryAll {
-                                  Picker("Endpoint", selection: $endpointManager.selectedEndpointID) {
-                                      ForEach(endpointManager.endpoints) { endpoint in
-                                          Text(endpoint.name).tag(endpoint.id)
-                                      }
-                                  }
-                                  .pickerStyle(MenuPickerStyle())
-                              } else {
-                                  Text("App will try each saved endpoint in order.")
-                                      .font(.footnote)
-                                      .foregroundColor(.secondary)
-                              }
-                              Button("Manage API Endpoints") {
-                                  showEndpointManager = true
-                              }
-                          }
-
                           Section {
                               Button(action: {
                                   Task {
                                       await downloader.download(
                                           urlString: urlString,
-                                          mode: downloadMode,
-                                          endpoints: endpointManager.getEndpointsToTry()
+                                          mode: downloadMode
                                       )
                                   }
                               }) {
@@ -129,10 +107,6 @@ jobs:
                           Button("OK", role: .cancel) { }
                       } message: {
                           Text(downloader.errorMessage)
-                      }
-                      .sheet(isPresented: $showEndpointManager) {
-                          EndpointManagerView()
-                              .environmentObject(endpointManager)
                       }
                   }
               }
@@ -206,173 +180,6 @@ jobs:
           }
           EOF
 
-          cat > project/Sources/EndpointManager.swift <<'EOF'
-          import Foundation
-          import SwiftUI
-
-          struct APIEndpoint: Identifiable, Codable, Equatable {
-              var id: UUID = UUID()
-              var name: String
-              var url: String
-          }
-
-          final class EndpointManager: ObservableObject {
-              @Published var endpoints: [APIEndpoint] = [] {
-                  didSet { saveEndpoints() }
-              }
-              @Published var selectedEndpointID: UUID? {
-                  didSet { saveSelected() }
-              }
-              @Published var autoTryAll: Bool = false {
-                  didSet { saveAutoTryAll() }
-              }
-
-              private let endpointsKey = "apiEndpoints"
-              private let selectedKey = "selectedEndpointID"
-              private let autoTryKey = "autoTryAll"
-
-              init() {
-                  load()
-                  if endpoints.isEmpty {
-                      // Built-in defaults – you can add more
-                      endpoints = [
-                          APIEndpoint(name: "Cobalt Official", url: "https://api.cobalt.tools"),
-                          APIEndpoint(name: "Cobalt Public 2", url: "https://co.wuk.sh"),
-                          APIEndpoint(name: "Cobalt Public 3", url: "https://cobalt-api.kwiatekmiki.com"),
-                          APIEndpoint(name: "Cobalt Public 4", url: "https://cobalt-api.vercel.app")
-                      ]
-                  }
-                  if selectedEndpointID == nil || !endpoints.contains(where: { $0.id == selectedEndpointID }) {
-                      selectedEndpointID = endpoints.first?.id
-                  }
-              }
-
-              func getEndpointsToTry() -> [APIEndpoint] {
-                  if autoTryAll {
-                      return endpoints
-                  } else {
-                      if let selected = endpoints.first(where: { $0.id == selectedEndpointID }) {
-                          return [selected]
-                      }
-                      return []
-                  }
-              }
-
-              func addEndpoint(name: String, url: String) {
-                  let endpoint = APIEndpoint(name: name, url: url)
-                  endpoints.append(endpoint)
-                  if selectedEndpointID == nil {
-                      selectedEndpointID = endpoint.id
-                  }
-              }
-
-              func deleteEndpoint(_ endpoint: APIEndpoint) {
-                  endpoints.removeAll { $0.id == endpoint.id }
-                  if selectedEndpointID == endpoint.id {
-                      selectedEndpointID = endpoints.first?.id
-                  }
-              }
-
-              private func saveEndpoints() {
-                  if let data = try? JSONEncoder().encode(endpoints) {
-                      UserDefaults.standard.set(data, forKey: endpointsKey)
-                  }
-              }
-
-              private func saveSelected() {
-                  if let id = selectedEndpointID {
-                      UserDefaults.standard.set(id.uuidString, forKey: selectedKey)
-                  }
-              }
-
-              private func saveAutoTryAll() {
-                  UserDefaults.standard.set(autoTryAll, forKey: autoTryKey)
-              }
-
-              private func load() {
-                  if let data = UserDefaults.standard.data(forKey: endpointsKey),
-                     let decoded = try? JSONDecoder().decode([APIEndpoint].self, from: data) {
-                      endpoints = decoded
-                  }
-                  if let idString = UserDefaults.standard.string(forKey: selectedKey),
-                     let uuid = UUID(uuidString: idString) {
-                      selectedEndpointID = uuid
-                  }
-                  autoTryAll = UserDefaults.standard.bool(forKey: autoTryKey)
-              }
-          }
-          EOF
-
-          cat > project/Sources/EndpointManagerView.swift <<'EOF'
-          import SwiftUI
-
-          struct EndpointManagerView: View {
-              @EnvironmentObject var endpointManager: EndpointManager
-              @Environment(\.dismiss) private var dismiss
-              @State private var newName = ""
-              @State private var newURL = ""
-
-              var body: some View {
-                  NavigationView {
-                      List {
-                          Section(header: Text("Saved Endpoints")) {
-                              ForEach(endpointManager.endpoints) { endpoint in
-                                  HStack {
-                                      VStack(alignment: .leading) {
-                                          Text(endpoint.name)
-                                              .font(.headline)
-                                          Text(endpoint.url)
-                                              .font(.caption)
-                                              .foregroundColor(.secondary)
-                                      }
-                                      Spacer()
-                                      if endpoint.id == endpointManager.selectedEndpointID {
-                                          Image(systemName: "checkmark.circle.fill")
-                                              .foregroundColor(.blue)
-                                      }
-                                  }
-                                  .contentShape(Rectangle())
-                                  .onTapGesture {
-                                      endpointManager.selectedEndpointID = endpoint.id
-                                  }
-                                  .swipeActions {
-                                      Button(role: .destructive) {
-                                          endpointManager.deleteEndpoint(endpoint)
-                                      } label: {
-                                          Label("Delete", systemImage: "trash")
-                                      }
-                                  }
-                              }
-                          }
-
-                          Section(header: Text("Add New Endpoint")) {
-                              TextField("Name", text: $newName)
-                              TextField("URL (e.g., https://my-server.com)", text: $newURL)
-                                  .textInputAutocapitalization(.never)
-                                  .disableAutocorrection(true)
-                              Button("Add Endpoint") {
-                                  let name = newName.trimmingCharacters(in: .whitespaces)
-                                  let url = newURL.trimmingCharacters(in: .whitespaces)
-                                  if !name.isEmpty && !url.isEmpty {
-                                      endpointManager.addEndpoint(name: name, url: url)
-                                      newName = ""
-                                      newURL = ""
-                                  }
-                              }
-                              .disabled(newName.isEmpty || newURL.isEmpty)
-                          }
-                      }
-                      .navigationTitle("API Endpoints")
-                      .toolbar {
-                          ToolbarItem(placement: .confirmationAction) {
-                              Button("Done") { dismiss() }
-                          }
-                      }
-                  }
-              }
-          }
-          EOF
-
           cat > project/Sources/DownloadManager.swift <<'EOF'
           import Foundation
           import Combine
@@ -396,13 +203,15 @@ jobs:
               private var downloadTask: URLSessionDownloadTask?
               private var expectedFilename: String = ""
 
-              func download(urlString: String, mode: String, endpoints: [APIEndpoint]) async {
-                  guard !endpoints.isEmpty else {
-                      errorMessage = "No API endpoints configured"
-                      showError = true
-                      return
-                  }
+              // Hardcoded fallback endpoints – you can edit this list if you want
+              private let fallbackEndpoints = [
+                  "https://api.cobalt.tools",
+                  "https://co.wuk.sh",
+                  "https://cobalt-api.kwiatekmiki.com",
+                  "https://cobalt-api.vercel.app"
+              ]
 
+              func download(urlString: String, mode: String) async {
                   isDownloading = true
                   progress = 0
                   downloadedURL = nil
@@ -410,12 +219,12 @@ jobs:
 
                   var lastError = "All endpoints failed"
 
-                  for endpoint in endpoints {
+                  for endpoint in fallbackEndpoints {
                       do {
                           let mediaURL = try await fetchMediaURL(
                               urlString: urlString,
                               mode: mode,
-                              apiBaseURL: endpoint.url
+                              apiBaseURL: endpoint
                           )
                           // Download the file
                           let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
@@ -447,7 +256,7 @@ jobs:
                           isDownloading = false
                           return
                       } catch {
-                          lastError = "\(endpoint.name): \(error.localizedDescription)"
+                          lastError = "\(endpoint): \(error.localizedDescription)"
                           progress = 0
                       }
                   }
@@ -587,9 +396,7 @@ jobs:
                   1A0000010000000000000002 /* MainTabView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000020000000000000002 /* MainTabView.swift */; };
                   1A0000010000000000000003 /* DownloaderView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000020000000000000003 /* DownloaderView.swift */; };
                   1A0000010000000000000004 /* DownloadsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000020000000000000004 /* DownloadsView.swift */; };
-                  1A0000010000000000000005 /* EndpointManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000020000000000000005 /* EndpointManager.swift */; };
-                  1A0000010000000000000006 /* EndpointManagerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000020000000000000006 /* EndpointManagerView.swift */; };
-                  1A0000010000000000000007 /* DownloadManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000020000000000000007 /* DownloadManager.swift */; };
+                  1A0000010000000000000005 /* DownloadManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000020000000000000005 /* DownloadManager.swift */; };
           /* End PBXBuildFile section */
 
           /* Begin PBXFileReference section */
@@ -597,9 +404,7 @@ jobs:
                   1A0000020000000000000002 /* MainTabView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainTabView.swift; sourceTree = "<group>"; };
                   1A0000020000000000000003 /* DownloaderView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloaderView.swift; sourceTree = "<group>"; };
                   1A0000020000000000000004 /* DownloadsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadsView.swift; sourceTree = "<group>"; };
-                  1A0000020000000000000005 /* EndpointManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EndpointManager.swift; sourceTree = "<group>"; };
-                  1A0000020000000000000006 /* EndpointManagerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EndpointManagerView.swift; sourceTree = "<group>"; };
-                  1A0000020000000000000007 /* DownloadManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadManager.swift; sourceTree = "<group>"; };
+                  1A0000020000000000000005 /* DownloadManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadManager.swift; sourceTree = "<group>"; };
                   1A0000030000000000000001 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
                   1A0000040000000000000001 /* CobaltDownloader.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CobaltDownloader.app; sourceTree = BUILT_PRODUCTS_DIR; };
           /* End PBXFileReference section */
@@ -631,9 +436,7 @@ jobs:
                           1A0000020000000000000002 /* MainTabView.swift */,
                           1A0000020000000000000003 /* DownloaderView.swift */,
                           1A0000020000000000000004 /* DownloadsView.swift */,
-                          1A0000020000000000000005 /* EndpointManager.swift */,
-                          1A0000020000000000000006 /* EndpointManagerView.swift */,
-                          1A0000020000000000000007 /* DownloadManager.swift */,
+                          1A0000020000000000000005 /* DownloadManager.swift */,
                       );
                       path = Sources;
                       sourceTree = "<group>";
@@ -718,9 +521,7 @@ jobs:
                           1A0000010000000000000002 /* MainTabView.swift in Sources */,
                           1A0000010000000000000003 /* DownloaderView.swift in Sources */,
                           1A0000010000000000000004 /* DownloadsView.swift in Sources */,
-                          1A0000010000000000000005 /* EndpointManager.swift in Sources */,
-                          1A0000010000000000000006 /* EndpointManagerView.swift in Sources */,
-                          1A0000010000000000000007 /* DownloadManager.swift in Sources */,
+                          1A0000010000000000000005 /* DownloadManager.swift in Sources */,
                       );
                       runOnlyForDeploymentPostprocessing = 0;
                   };
