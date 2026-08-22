@@ -39,7 +39,8 @@ jobs:
           mkdir -p wrapper
           cd wrapper
           npm init -y
-          npm install --no-audit --no-fund @capacitor/core @capacitor/cli @capacitor/ios
+          # Pin Capacitor to version 6 to ensure iOS 13+ compatibility
+          npm install --no-audit --no-fund @capacitor/core@6.0.0 @capacitor/cli@6.0.0 @capacitor/ios@6.0.0
 
           cat > capacitor.config.json <<EOF
           {
@@ -47,7 +48,7 @@ jobs:
             "appName": "${{ github.event.inputs.app_name }}",
             "webDir": "www",
             "ios": {
-              "minVersion": "14.0"
+              "minVersion": "13.0"
             },
             "server": {
               "allowNavigation": ["*"]
@@ -91,7 +92,7 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             DEVELOPMENT_TEAM="" \
-            IPHONEOS_DEPLOYMENT_TARGET=14.0
+            IPHONEOS_DEPLOYMENT_TARGET=13.0
 
           APP_PATH=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
           echo "App bundle: $APP_PATH"
