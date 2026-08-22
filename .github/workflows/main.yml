@@ -93,7 +93,6 @@ jobs:
                       if not files:
                           raise Exception("Download failed")
                       file_path = os.path.join(temp_dir, files[0])
-                      # Return the file directly; filename is set from the file path
                       return FileResponse(
                           file_path,
                           filename=os.path.basename(file_path),
@@ -504,7 +503,7 @@ jobs:
           }
           EOF
 
-          # UPDATED DownloadManager.swift – now handles direct binary response
+          # FIXED DownloadManager.swift – direct binary download with correct actor isolation
           cat > ios/Sources/DownloadManager.swift <<'EOF'
           import Foundation
           import Combine
@@ -540,7 +539,6 @@ jobs:
                       do {
                           let data = try await downloadData(from: endpoint.url, urlString: urlString, mode: mode)
                           try await saveData(data)
-                          // Success
                           isDownloading = false
                           return
                       } catch {
@@ -585,7 +583,7 @@ jobs:
                   let downloadsDir = documents.appendingPathComponent("Downloads", isDirectory: true)
                   try fileManager.createDirectory(at: downloadsDir, withIntermediateDirectories: true)
 
-                  let filename = "download_\(Int(Date().timeIntervalSince1970)).mp4" // default, will try to get from Content-Disposition
+                  let filename = "download_\(Int(Date().timeIntervalSince1970)).mp4"
                   // Try to get filename from Content-Disposition if available
                   if let response = downloadTask?.response as? HTTPURLResponse,
                      let disposition = response.allHeaderFields["Content-Disposition"] as? String,
@@ -603,7 +601,6 @@ jobs:
                       }
                   }
 
-                  // Fallback filename
                   let destination = downloadsDir.appendingPathComponent(filename)
                   try data.write(to: destination)
                   downloadedURL = destination
@@ -618,7 +615,10 @@ jobs:
                   didReceive response: URLResponse,
                   completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
               ) {
-                  expectedContentLength = response.expectedContentLength
+                  let expectedLength = response.expectedContentLength
+                  Task { @MainActor in
+                      self.expectedContentLength = expectedLength
+                  }
                   completionHandler(.allow)
               }
 
