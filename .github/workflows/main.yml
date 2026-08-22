@@ -46,6 +46,9 @@ jobs:
             "appId": "${{ github.event.inputs.bundle_id }}",
             "appName": "${{ github.event.inputs.app_name }}",
             "webDir": "www",
+            "ios": {
+              "minVersion": "14.0"
+            },
             "server": {
               "allowNavigation": ["*"]
             }
@@ -88,7 +91,7 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             DEVELOPMENT_TEAM="" \
-            IPHONEOS_DEPLOYMENT_TARGET=13.0
+            IPHONEOS_DEPLOYMENT_TARGET=14.0
 
           APP_PATH=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
           echo "App bundle: $APP_PATH"
