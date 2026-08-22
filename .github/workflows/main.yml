@@ -14,7 +14,6 @@ jobs:
           mkdir -p project/Sources
           mkdir -p project/CobaltDownloader.xcodeproj
 
-          # Create Swift source files
           cat > project/Sources/CobaltDownloaderApp.swift <<'EOF'
           import SwiftUI
 
@@ -22,20 +21,40 @@ jobs:
           struct CobaltDownloaderApp: App {
               var body: some Scene {
                   WindowGroup {
-                      ContentView()
+                      MainTabView()
                   }
               }
           }
           EOF
 
-          cat > project/Sources/ContentView.swift <<'EOF'
+          cat > project/Sources/MainTabView.swift <<'EOF'
           import SwiftUI
 
-          struct ContentView: View {
+          struct MainTabView: View {
+              var body: some View {
+                  TabView {
+                      DownloaderView()
+                          .tabItem {
+                              Label("Download", systemImage: "arrow.down.circle.fill")
+                          }
+                      DownloadsView()
+                          .tabItem {
+                              Label("Files", systemImage: "folder.fill")
+                          }
+                  }
+              }
+          }
+          EOF
+
+          cat > project/Sources/DownloaderView.swift <<'EOF'
+          import SwiftUI
+
+          struct DownloaderView: View {
               @StateObject private var downloader = DownloadManager()
+              @StateObject private var endpointManager = EndpointManager()
               @State private var urlString = ""
               @State private var downloadMode = "auto"
-              @State private var apiBaseURL = "https://api.cobalt.tools"
+              @State private var showEndpointManager = false
 
               var body: some View {
                   NavigationView {
@@ -50,27 +69,32 @@ jobs:
                               Picker("Type", selection: $downloadMode) {
                                   Text("Auto").tag("auto")
                                   Text("Audio").tag("audio")
-                                  Text("Mute (no audio)").tag("mute")
+                                  Text("Mute").tag("mute")
                               }
                               .pickerStyle(SegmentedPickerStyle())
                           }
 
                           Section(header: Text("API Server")) {
-                              TextField("API Base URL", text: $apiBaseURL)
-                                  .textInputAutocapitalization(.never)
-                                  .disableAutocorrection(true)
-                              Text("Default is Cobalt public API. You can self-host for better reliability.")
-                                  .font(.footnote)
-                                  .foregroundColor(.secondary)
+                              Picker("Endpoint", selection: $endpointManager.selectedEndpointID) {
+                                  ForEach(endpointManager.endpoints) { endpoint in
+                                      Text(endpoint.name).tag(endpoint.id)
+                                  }
+                              }
+                              .pickerStyle(MenuPickerStyle())
+                              Button("Manage API Endpoints") {
+                                  showEndpointManager = true
+                              }
                           }
 
                           Section {
                               Button(action: {
+                                  let selected = endpointManager.endpoints.first { $0.id == endpointManager.selectedEndpointID }
+                                  guard let baseURL = selected?.url else { return }
                                   Task {
                                       await downloader.download(
                                           urlString: urlString,
                                           mode: downloadMode,
-                                          apiBaseURL: apiBaseURL
+                                          apiBaseURL: baseURL
                                       )
                                   }
                               }) {
@@ -100,6 +124,223 @@ jobs:
                           Button("OK", role: .cancel) { }
                       } message: {
                           Text(downloader.errorMessage)
+                      }
+                      .sheet(isPresented: $showEndpointManager) {
+                          EndpointManagerView()
+                              .environmentObject(endpointManager)
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat > project/Sources/DownloadsView.swift <<'EOF'
+          import SwiftUI
+
+          struct DownloadsView: View {
+              @State private var files: [URL] = []
+              @State private var refreshID = UUID()
+              private let downloadsDir: URL = {
+                  let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                  return docs.appendingPathComponent("Downloads", isDirectory: true)
+              }()
+
+              var body: some View {
+                  NavigationView {
+                      List {
+                          if files.isEmpty {
+                              Text("No downloaded files yet")
+                                  .foregroundColor(.secondary)
+                          } else {
+                              ForEach(files, id: \.self) { file in
+                                  HStack {
+                                      VStack(alignment: .leading) {
+                                          Text(file.lastPathComponent)
+                                              .font(.subheadline)
+                                          Text(file.fileSizeString)
+                                              .font(.caption)
+                                              .foregroundColor(.secondary)
+                                      }
+                                      Spacer()
+                                      ShareLink(item: file) {
+                                          Image(systemName: "square.and.arrow.up")
+                                      }
+                                      Button(role: .destructive) {
+                                          try? FileManager.default.removeItem(at: file)
+                                          loadFiles()
+                                      } label: {
+                                          Image(systemName: "trash")
+                                              .foregroundColor(.red)
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                      .navigationTitle("Downloads")
+                      .id(refreshID)
+                      .onAppear(perform: loadFiles)
+                  }
+              }
+
+              private func loadFiles() {
+                  do {
+                      try FileManager.default.createDirectory(at: downloadsDir, withIntermediateDirectories: true)
+                      files = try FileManager.default.contentsOfDirectory(at: downloadsDir, includingPropertiesForKeys: nil)
+                          .filter { $0.pathExtension != "" }
+                  } catch {
+                      files = []
+                  }
+                  refreshID = UUID()
+              }
+          }
+
+          extension URL {
+              var fileSizeString: String {
+                  let size = (try? resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+                  let formatter = ByteCountFormatter()
+                  formatter.countStyle = .file
+                  return formatter.string(fromByteCount: Int64(size))
+              }
+          }
+          EOF
+
+          cat > project/Sources/EndpointManager.swift <<'EOF'
+          import Foundation
+          import SwiftUI
+
+          struct APIEndpoint: Identifiable, Codable, Equatable {
+              var id: UUID = UUID()
+              var name: String
+              var url: String
+          }
+
+          final class EndpointManager: ObservableObject {
+              @Published var endpoints: [APIEndpoint] = [] {
+                  didSet { save() }
+              }
+              @Published var selectedEndpointID: UUID? {
+                  didSet { saveSelected() }
+              }
+
+              private let endpointsKey = "apiEndpoints"
+              private let selectedKey = "selectedEndpointID"
+
+              init() {
+                  load()
+                  if endpoints.isEmpty {
+                      endpoints = [
+                          APIEndpoint(name: "Cobalt Public", url: "https://api.cobalt.tools")
+                      ]
+                  }
+                  if selectedEndpointID == nil || !endpoints.contains(where: { $0.id == selectedEndpointID }) {
+                      selectedEndpointID = endpoints.first?.id
+                  }
+              }
+
+              func addEndpoint(name: String, url: String) {
+                  let endpoint = APIEndpoint(name: name, url: url)
+                  endpoints.append(endpoint)
+                  if selectedEndpointID == nil {
+                      selectedEndpointID = endpoint.id
+                  }
+              }
+
+              func deleteEndpoint(_ endpoint: APIEndpoint) {
+                  endpoints.removeAll { $0.id == endpoint.id }
+                  if selectedEndpointID == endpoint.id {
+                      selectedEndpointID = endpoints.first?.id
+                  }
+              }
+
+              private func save() {
+                  if let data = try? JSONEncoder().encode(endpoints) {
+                      UserDefaults.standard.set(data, forKey: endpointsKey)
+                  }
+              }
+
+              private func saveSelected() {
+                  if let id = selectedEndpointID {
+                      UserDefaults.standard.set(id.uuidString, forKey: selectedKey)
+                  }
+              }
+
+              private func load() {
+                  if let data = UserDefaults.standard.data(forKey: endpointsKey),
+                     let decoded = try? JSONDecoder().decode([APIEndpoint].self, from: data) {
+                      endpoints = decoded
+                  }
+                  if let idString = UserDefaults.standard.string(forKey: selectedKey),
+                     let uuid = UUID(uuidString: idString) {
+                      selectedEndpointID = uuid
+                  }
+              }
+          }
+          EOF
+
+          cat > project/Sources/EndpointManagerView.swift <<'EOF'
+          import SwiftUI
+
+          struct EndpointManagerView: View {
+              @EnvironmentObject var endpointManager: EndpointManager
+              @Environment(\.dismiss) private var dismiss
+              @State private var newName = ""
+              @State private var newURL = ""
+
+              var body: some View {
+                  NavigationView {
+                      List {
+                          Section(header: Text("Saved Endpoints")) {
+                              ForEach(endpointManager.endpoints) { endpoint in
+                                  HStack {
+                                      VStack(alignment: .leading) {
+                                          Text(endpoint.name)
+                                              .font(.headline)
+                                          Text(endpoint.url)
+                                              .font(.caption)
+                                              .foregroundColor(.secondary)
+                                      }
+                                      Spacer()
+                                      if endpoint.id == endpointManager.selectedEndpointID {
+                                          Image(systemName: "checkmark.circle.fill")
+                                              .foregroundColor(.blue)
+                                      }
+                                  }
+                                  .contentShape(Rectangle())
+                                  .onTapGesture {
+                                      endpointManager.selectedEndpointID = endpoint.id
+                                  }
+                                  .swipeActions {
+                                      Button(role: .destructive) {
+                                          endpointManager.deleteEndpoint(endpoint)
+                                      } label: {
+                                          Label("Delete", systemImage: "trash")
+                                      }
+                                  }
+                              }
+                          }
+
+                          Section(header: Text("Add New Endpoint")) {
+                              TextField("Name", text: $newName)
+                              TextField("URL (e.g., https://my-server.com)", text: $newURL)
+                                  .textInputAutocapitalization(.never)
+                                  .disableAutocorrection(true)
+                              Button("Add Endpoint") {
+                                  let name = newName.trimmingCharacters(in: .whitespaces)
+                                  let url = newURL.trimmingCharacters(in: .whitespaces)
+                                  if !name.isEmpty && !url.isEmpty {
+                                      endpointManager.addEndpoint(name: name, url: url)
+                                      newName = ""
+                                      newURL = ""
+                                  }
+                              }
+                              .disabled(newName.isEmpty || newURL.isEmpty)
+                          }
+                      }
+                      .navigationTitle("API Endpoints")
+                      .toolbar {
+                          ToolbarItem(placement: .confirmationAction) {
+                              Button("Done") { dismiss() }
+                          }
                       }
                   }
               }
@@ -317,14 +558,22 @@ jobs:
 
           /* Begin PBXBuildFile section */
                   1A0000010000000000000001 /* CobaltDownloaderApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000020000000000000001 /* CobaltDownloaderApp.swift */; };
-                  1A0000010000000000000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000020000000000000002 /* ContentView.swift */; };
-                  1A0000010000000000000003 /* DownloadManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000020000000000000003 /* DownloadManager.swift */; };
+                  1A0000010000000000000002 /* MainTabView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000020000000000000002 /* MainTabView.swift */; };
+                  1A0000010000000000000003 /* DownloaderView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000020000000000000003 /* DownloaderView.swift */; };
+                  1A0000010000000000000004 /* DownloadsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000020000000000000004 /* DownloadsView.swift */; };
+                  1A0000010000000000000005 /* EndpointManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000020000000000000005 /* EndpointManager.swift */; };
+                  1A0000010000000000000006 /* EndpointManagerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000020000000000000006 /* EndpointManagerView.swift */; };
+                  1A0000010000000000000007 /* DownloadManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000020000000000000007 /* DownloadManager.swift */; };
           /* End PBXBuildFile section */
 
           /* Begin PBXFileReference section */
                   1A0000020000000000000001 /* CobaltDownloaderApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CobaltDownloaderApp.swift; sourceTree = "<group>"; };
-                  1A0000020000000000000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
-                  1A0000020000000000000003 /* DownloadManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadManager.swift; sourceTree = "<group>"; };
+                  1A0000020000000000000002 /* MainTabView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainTabView.swift; sourceTree = "<group>"; };
+                  1A0000020000000000000003 /* DownloaderView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloaderView.swift; sourceTree = "<group>"; };
+                  1A0000020000000000000004 /* DownloadsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadsView.swift; sourceTree = "<group>"; };
+                  1A0000020000000000000005 /* EndpointManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EndpointManager.swift; sourceTree = "<group>"; };
+                  1A0000020000000000000006 /* EndpointManagerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EndpointManagerView.swift; sourceTree = "<group>"; };
+                  1A0000020000000000000007 /* DownloadManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadManager.swift; sourceTree = "<group>"; };
                   1A0000030000000000000001 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
                   1A0000040000000000000001 /* CobaltDownloader.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CobaltDownloader.app; sourceTree = BUILT_PRODUCTS_DIR; };
           /* End PBXFileReference section */
@@ -353,8 +602,12 @@ jobs:
                       isa = PBXGroup;
                       children = (
                           1A0000020000000000000001 /* CobaltDownloaderApp.swift */,
-                          1A0000020000000000000002 /* ContentView.swift */,
-                          1A0000020000000000000003 /* DownloadManager.swift */,
+                          1A0000020000000000000002 /* MainTabView.swift */,
+                          1A0000020000000000000003 /* DownloaderView.swift */,
+                          1A0000020000000000000004 /* DownloadsView.swift */,
+                          1A0000020000000000000005 /* EndpointManager.swift */,
+                          1A0000020000000000000006 /* EndpointManagerView.swift */,
+                          1A0000020000000000000007 /* DownloadManager.swift */,
                       );
                       path = Sources;
                       sourceTree = "<group>";
@@ -436,8 +689,12 @@ jobs:
                       buildActionMask = 2147483647;
                       files = (
                           1A0000010000000000000001 /* CobaltDownloaderApp.swift in Sources */,
-                          1A0000010000000000000002 /* ContentView.swift in Sources */,
-                          1A0000010000000000000003 /* DownloadManager.swift in Sources */,
+                          1A0000010000000000000002 /* MainTabView.swift in Sources */,
+                          1A0000010000000000000003 /* DownloaderView.swift in Sources */,
+                          1A0000010000000000000004 /* DownloadsView.swift in Sources */,
+                          1A0000010000000000000005 /* EndpointManager.swift in Sources */,
+                          1A0000010000000000000006 /* EndpointManagerView.swift in Sources */,
+                          1A0000010000000000000007 /* DownloadManager.swift in Sources */,
                       );
                       runOnlyForDeploymentPostprocessing = 0;
                   };
