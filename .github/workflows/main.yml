@@ -369,7 +369,7 @@ jobs:
                   if endpoints.isEmpty {
                       // Default endpoint is the user's private API (baked in)
                       endpoints = [
-                          APIEndpoint(name: "My Private API", url: "$API_URL")
+                          APIEndpoint(name: "My Private API", url: "__API_URL__")
                       ]
                   }
                   if selectedEndpointID == nil || !endpoints.contains(where: { $0.id == selectedEndpointID }) {
@@ -1025,9 +1025,10 @@ jobs:
           }
           EOF
 
-          # Replace placeholders with actual values
-          sed -i "s/__APP_NAME__/$APP_NAME/g" ios/Info.plist
-          sed -i "s/__BUNDLE_ID__/$BUNDLE_ID/g" ios/CobaltDownloader.xcodeproj/project.pbxproj
+          # Replace placeholders with actual values (BSD sed requires empty backup extension)
+          sed -i '' "s|__APP_NAME__|$APP_NAME|g" ios/Info.plist
+          sed -i '' "s|__BUNDLE_ID__|$BUNDLE_ID|g" ios/CobaltDownloader.xcodeproj/project.pbxproj
+          sed -i '' "s|__API_URL__|$API_URL|g" ios/Sources/EndpointManager.swift
 
       # ------------------------------------------------------------
       # 4. BUILD UNSIGNED IPA
