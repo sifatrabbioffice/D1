@@ -503,7 +503,7 @@ jobs:
           }
           EOF
 
-          # FIXED DownloadManager.swift – direct binary download with correct actor isolation
+          # FIXED DownloadManager.swift – now checks HTTP status code
           cat > ios/Sources/DownloadManager.swift <<'EOF'
           import Foundation
           import Combine
@@ -519,6 +519,7 @@ jobs:
               private var downloadTask: URLSessionDataTask?
               private var receivedData = Data()
               private var expectedContentLength: Int64 = 0
+              private var httpStatusCode: Int?
               private var continuation: CheckedContinuation<Data, Error>?
 
               func download(urlString: String, mode: String, endpoints: [APIEndpoint]) async {
@@ -568,6 +569,11 @@ jobs:
                   ]
                   request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
+                  // Reset state
+                  receivedData = Data()
+                  expectedContentLength = 0
+                  httpStatusCode = nil
+
                   let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
                   downloadTask = session.dataTask(with: request)
                   downloadTask?.resume()
@@ -578,6 +584,11 @@ jobs:
               }
 
               private func saveData(_ data: Data) async throws {
+                  // Ensure we actually received data
+                  guard !data.isEmpty else {
+                      throw NSError(domain: "Received empty data", code: 2)
+                  }
+
                   let fileManager = FileManager.default
                   let documents = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
                   let downloadsDir = documents.appendingPathComponent("Downloads", isDirectory: true)
@@ -615,8 +626,10 @@ jobs:
                   didReceive response: URLResponse,
                   completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
               ) {
+                  let statusCode = (response as? HTTPURLResponse)?.statusCode
                   let expectedLength = response.expectedContentLength
                   Task { @MainActor in
+                      self.httpStatusCode = statusCode
                       self.expectedContentLength = expectedLength
                   }
                   completionHandler(.allow)
@@ -644,11 +657,18 @@ jobs:
                       if let error = error {
                           self.continuation?.resume(throwing: error)
                       } else {
-                          self.continuation?.resume(returning: self.receivedData)
+                          // Check HTTP status code
+                          if let statusCode = self.httpStatusCode,
+                             !(200...299).contains(statusCode) {
+                              self.continuation?.resume(throwing: NSError(domain: "API error (HTTP \(statusCode))", code: 1))
+                          } else {
+                              self.continuation?.resume(returning: self.receivedData)
+                          }
                       }
                       self.continuation = nil
                       self.receivedData = Data()
                       self.expectedContentLength = 0
+                      self.httpStatusCode = nil
                   }
               }
           }
